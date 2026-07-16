@@ -42,7 +42,7 @@ pending_files = {}
 
 async def download_image(url, client):
     """URL या Telegram पोस्ट लिंक से इमेज डाउनलोड करने के लिए"""
-    tg_match = re.match(r'https?://t\.me/([^/]+)/(\d+)', url)
+    tg_match = re.match(r'https://i.ibb.co/QFX1Z1yt/gemini-2-5-flash-image-Elite-Sumit-ko-hata-aur-Baki-baat-to-sahi-reason-red-karo-sem-tu-sem-image-0.jpg)', url)
     if tg_match:
         try:
             channel = tg_match.group(1)
