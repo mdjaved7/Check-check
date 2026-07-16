@@ -40,19 +40,22 @@ STATE_TTL_SECONDS = 600  # 10 मिनट बाद रैम से पें�
 pending_files: Dict[int, Dict[str, Any]] = {}
 
 # --- नेटिव एसिंक्रोनस हेल्थ चेक वेब सर्वर (Railway / Render के लिए) ---
-async def health_check_handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
-    return aiohttp.web.Response(text="Bot is alive and running successfully!", content_type="text/plain")
+from aiohttp import web
+
+async def health_check_handler(request: web.Request) -> web.Response:
+    return web.Response(text="Bot is alive and running successfully!", content_type="text/plain")
 
 async def start_health_server() -> None:
     """चैनल के पोर्ट को बाइंड करने के लिए एसिंक्रोनस सर्वर शुरू करता है"""
-    app = aiohttp.web.Application()
+    app = web.Application()
     app.router.add_get('/', health_check_handler)
-    runner = aiohttp.web.AppRunner(app)
+    runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
-    site = aiohttp.web.TCPSite(runner, '0.0.0.0', port)
+    site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     logger.info(f"🖥️ Native Async Health check server active on port {port}")
+
 
 # --- बैकग्राउंड रैम क्लीनर टास्क ---
 async def track_and_expire_states() -> None:
