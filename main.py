@@ -25,10 +25,9 @@ logging.basicConfig(
 logger = logging.getLogger("TaggerBot")
 
 # --- एनवायरनमेंट वेरिएबल्स की जांच ---
-API_ID_ENV = os.environ.get("34801155")
-API_HASH = os.environ.get("d7846c4d0f2c343dd5b67c80d45409e8")
-BOT_TOKEN = os.environ.get("8918721301:AAGQomTKJ5vtViPRyAhHAZ51_eEmJk1v25I")
-
+API_ID = 34801155
+API_HASH = "d7846c4d0f2c343dd5b67c80d45409e8"
+BOT_TOKEN = "8918721301:AAGQomTKJ5vtViPRyAhHAZ51_eEmJk1v25I"
 if not (API_ID_ENV and API_HASH and BOT_TOKEN):
     logger.critical("❌ Missing critical environment variables: API_ID, API_HASH, or BOT_TOKEN!")
     raise ValueError("Ensure API_ID, API_HASH, and BOT_TOKEN are set in your environment configuration.")
