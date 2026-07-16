@@ -2,7 +2,6 @@ import os
 import re
 import time
 import logging
-import pathlib
 import asyncio
 import tempfile
 import aiohttp
@@ -11,6 +10,7 @@ from typing import Dict, Any, Optional, Tuple
 # Telethon Imports
 from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeAudio, Message
+from telethon.errors import FloodWaitError, MessageNotModifiedError
 
 # Mutagen Metadata Imports
 from mutagen.mp3 import MP3
@@ -33,15 +33,29 @@ BOT_TOKEN = "8918721301:AAGQomTKJ5vtViPRyAhHAZ51_eEmJk1v25I"
 ARTIST_NAME = "@AllstoryFM2"
 STATE_TTL_SECONDS = 600  
 
-# --- इन-मेमोरी स्टेट मैनेजर और टास्क क्यू ---
+# --- State Management & Queue System ---
 pending_files: Dict[int, Dict[str, Any]] = {}
-task_queue: asyncio.Queue = asyncio.Queue()  # सभी टास्क को लाइन में रखने के लिए
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(5)  # Phase 1: Max 5 parallel downloads/processing at a time
+
+class ChatQueue:
+    """हर यूजर/चैट के लिए एक अलग Sequential Queue Manager"""
+    def __init__(self):
+        self.next_assign_seq = 0
+        self.current_upload_seq = 0
+        self.condition = asyncio.Condition()
+
+chat_queues: Dict[int, ChatQueue] = {}
+
+def get_chat_queue(chat_id: int) -> ChatQueue:
+    if chat_id not in chat_queues:
+        chat_queues[chat_id] = ChatQueue()
+    return chat_queues[chat_id]
 
 # --- नेटिव एसिंक्रोनस हेल्थ चेक वेब सर्वर ---
 from aiohttp import web
 
 async def health_check_handler(request: web.Request) -> web.Response:
-    return web.Response(text="Bot is alive and running successfully!", content_type="text/plain")
+    return web.Response(text="Bot is alive and running successfully in Production Mode!", content_type="text/plain")
 
 async def start_health_server() -> None:
     app = web.Application()
@@ -53,7 +67,6 @@ async def start_health_server() -> None:
     await site.start()
     logger.info(f"🖥️ Native Async Health check server active on port {port}")
 
-# --- बैकग्राउंड रैम क्लीनर टास्क ---
 async def track_and_expire_states() -> None:
     while True:
         await asyncio.sleep(60)
@@ -71,11 +84,9 @@ def sanitize_filename(filename: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "", name)
 
 def extract_episode_number(filename: str, caption: str = "") -> str:
-    match = re.search(r'(?:ep|episode|story)[-_\s]*(\d+)', filename, re.IGNORECASE)
-    if match: return match.group(1)
-    if caption:
-        match_cap = re.search(r'(?:ep|episode|story)[-_\s]*(\d+)', caption, re.IGNORECASE)
-        if match_cap: return match_cap.group(1)
+    for text in [filename, caption]:
+        match = re.search(r'(?:ep|episode|story)[-_\s]*(\d+)', text, re.IGNORECASE)
+        if match: return match.group(1)
     fallback = re.search(r'\d+', filename)
     if fallback: return fallback.group()
     if caption:
@@ -96,7 +107,34 @@ def get_audio_duration(file_path: str, ext: str) -> int:
         logger.error(f"Failed to read audio duration: {e}")
     return 0
 
-# --- इमेज डाउनलोडर ---
+# --- एंटी-फ्लड सेफ एडिट और सेंड (Exponential Backoff) ---
+async def safe_edit_message(message: Any, text: str) -> None:
+    try:
+        await message.edit(text)
+    except MessageNotModifiedError:
+        pass  # इग्नोर करें, मैसेज पहले से ही इस टेक्स्ट पर है
+    except FloodWaitError as e:
+        logger.warning(f"FloodWait on edit! Sleeping for {e.seconds}s")
+        await asyncio.sleep(e.seconds + 2)
+        await safe_edit_message(message, text)
+    except Exception as e:
+        logger.error(f"Edit message error: {e}")
+
+async def safe_send_file(client, chat_id, file, **kwargs):
+    retries = 5
+    for attempt in range(retries):
+        try:
+            return await client.send_file(chat_id, file, **kwargs)
+        except FloodWaitError as e:
+            logger.warning(f"FloodWait on upload! Sleeping for {e.seconds}s")
+            await asyncio.sleep(e.seconds + 2)
+        except Exception as e:
+            logger.error(f"Upload attempt {attempt+1} failed: {e}")
+            if attempt == retries - 1:
+                raise e
+            await asyncio.sleep(3 * (attempt + 1))
+
+# --- इमेज डाउनलोडर्स ---
 async def download_image_from_url(url: str) -> Optional[bytes]:
     try:
         timeout = aiohttp.ClientTimeout(total=15)
@@ -132,7 +170,7 @@ async def download_image_from_tg(client: TelegramClient, url: str) -> Optional[b
         logger.error(f"Error resolving Telegram link: {e}")
     return None
 
-# --- मेटाडेटा इंजन ---
+# --- मेटाडेटा इंजन (Strict Cleanup) ---
 def process_mp3_metadata(file_path: str, title: str, artist: str, album: str, image_data: bytes) -> bool:
     try:
         try: audio = MP3(file_path, ID3=ID3)
@@ -140,9 +178,12 @@ def process_mp3_metadata(file_path: str, title: str, artist: str, album: str, im
             audio = MP3(file_path)
             audio.add_tags()
         if audio.tags is None: audio.add_tags()
+        
+        # Remove all duplicates before writing
         for tag in ["TIT2", "TPE1", "TALB"]: audio.tags.delall(tag)
         keys_to_delete = [k for k in audio.tags.keys() if k.startswith("APIC")]
         for key in keys_to_delete: audio.tags.pop(key, None)
+            
         audio.tags.add(TIT2(encoding=3, text=title))
         audio.tags.add(TPE1(encoding=3, text=artist))
         audio.tags.add(TALB(encoding=3, text=album))
@@ -157,6 +198,7 @@ def process_mp3_metadata(file_path: str, title: str, artist: str, album: str, im
 def process_m4a_metadata(file_path: str, title: str, artist: str, album: str, image_data: bytes) -> bool:
     try:
         audio = MP4(file_path)
+        # Overwrites inherently
         audio["\xa9nam"] = [title]
         audio["\xa9ART"] = [artist]
         audio["\xa9alb"] = [album]
@@ -168,12 +210,12 @@ def process_m4a_metadata(file_path: str, title: str, artist: str, album: str, im
         logger.error(f"Error processing M4A metadata: {e}")
         return False
 
-# --- मुख्य क्लाइंट इनिशियलाइजेशन ---
+# --- मुख्य क्लाइंट ---
 bot = TelegramClient('tagger_bot_session', API_ID, API_HASH)
 
 @bot.on(events.NewMessage(incoming=True, pattern='/start'))
 async def start_handler(event: events.NewMessage.Event) -> None:
-    await event.respond("👋 **नमस्ते! मैं आपका लाइन-बाय-लाइन ऑटोमैटिक ऑडियो टैगर बॉट हूँ।**\n\nअब आप एक साथ कई फाइल्स भेज सकते हैं, मैं उन्हें बिल्कुल सही क्रम में ही अपलोड करूँगा!")
+    await event.respond("👋 **नमस्ते! मैं आपका Production-Grade ऑटोमैटिक ऑडियो टैगर बॉट हूँ।**\n\nआप एक साथ अनलिमिटेड फाइल्स भेज सकते हैं। प्रोसेसिंग पैरेलल होगी, लेकिन अपलोडिंग **100% सही क्रम** में ही होगी!")
 
 @bot.on(events.NewMessage(incoming=True))
 async def incoming_message_handler(event: events.NewMessage.Event) -> None:
@@ -189,8 +231,11 @@ async def incoming_message_handler(event: events.NewMessage.Event) -> None:
         
         url_match = re.search(r'(https?://[^\s]+)', caption_text)
         if url_match:
-            # सीधे टास्क को Queue में डालें ताकि लाइन न टूटे
-            await task_queue.put((event, message.media, file_name, url_match.group(1), caption_text))
+            chat_queue = get_chat_queue(chat_id)
+            seq = chat_queue.next_assign_seq
+            chat_queue.next_assign_seq += 1
+            # Parallel processing task create
+            asyncio.create_task(hybrid_pipeline_worker(event, seq, chat_queue, message.media, file_name, url_match.group(1), caption_text))
             return
             
         pending_files[chat_id] = {"media": message.media, "file_name": file_name, "timestamp": time.time()}
@@ -204,87 +249,92 @@ async def incoming_message_handler(event: events.NewMessage.Event) -> None:
             
         if chat_id in pending_files:
             file_data = pending_files.pop(chat_id)
-            await task_queue.put((event, file_data["media"], file_data["file_name"], url_match.group(1), ""))
+            chat_queue = get_chat_queue(chat_id)
+            seq = chat_queue.next_assign_seq
+            chat_queue.next_assign_seq += 1
+            asyncio.create_task(hybrid_pipeline_worker(event, seq, chat_queue, file_data["media"], file_data["file_name"], url_match.group(1), ""))
         else:
             await event.respond("ℹ️ **पहले मुझे एक ऑडियो फाइल भेजें**।")
 
-# --- क्यू वर्कर (यह एक-एक करके ही प्रोसेस करेगा) ---
-async def queue_worker() -> None:
-    """यह बैकग्राउंड में चलता रहेगा और फाइल्स को एक-एक करके लाइन से प्रोसेस करेगा"""
-    while True:
-        event, file_media, file_name, image_url, caption_text = await task_queue.get()
-        try:
-            await pipeline_process_and_send(event, file_media, file_name, image_url, caption_text)
-        except Exception as e:
-            logger.error(f"Error in worker: {e}")
-        finally:
-            task_queue.task_done()
-
-# --- मुख्य प्रोसेसिंग पाइपलाइन ---
-async def pipeline_process_and_send(event: events.NewMessage.Event, file_media: Any, file_name: str, image_url: str, caption_text: str) -> None:
+# --- Hybrid Pipeline Worker (The Core Engine) ---
+async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_queue: ChatQueue, file_media: Any, file_name: str, image_url: str, caption_text: str) -> None:
     chat_id = event.chat_id
-    status_msg = await event.respond(f"⏳ **लाइन में आपका नंबर आ गया है: {file_name} की प्रोसेसिंग शुरू...**")
+    ep_num = extract_episode_number(file_name, caption_text)
+    status_msg = await event.respond(f"⏳ **Ep {ep_num}** कतार में है... (Order: #{seq+1})")
     
-    with tempfile.TemporaryDirectory() as temp_dir:
-        local_audio_path = os.path.join(temp_dir, file_name)
-        try:
-            await status_msg.edit("📥 **फ़ाइल डाउनलोड की जा रही है...**")
-            await bot.download_media(file_media, local_audio_path)
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_audio_path = os.path.join(temp_dir, file_name)
             
-            ep_num = extract_episode_number(file_name, caption_text)
-            title = f"Ep {ep_num}"
-            album = f"Ep {ep_num} - Single"
-            
-            await status_msg.edit("🖼️ **कवर इमेज डाउनलोड की जा रही है...**")
-            image_data = await download_image_from_tg(bot, image_url)
-            if not image_data:
-                image_data = await download_image_from_url(image_url)
+            # Phase 1: Parallel Processing (Controlled by Semaphore)
+            async with DOWNLOAD_SEMAPHORE:
+                await safe_edit_message(status_msg, f"📥 **Downloading Ep {ep_num}...**")
+                await bot.download_media(file_media, local_audio_path)
                 
-            if not image_data:
-                await status_msg.edit(f"❌ **{file_name} के लिए फोटो डाउनलोड नहीं हो सकी।**")
-                return
+                await safe_edit_message(status_msg, f"🖼️ **Image downloading for Ep {ep_num}...**")
+                image_data = await download_image_from_tg(bot, image_url)
+                if not image_data:
+                    # Fallback to direct URL
+                    image_data = await download_image_from_url(image_url)
+                    
+                if not image_data:
+                    await safe_edit_message(status_msg, f"❌ **Image error for Ep {ep_num}.**")
+                    return
 
-            await status_msg.edit("✍️ **ऑडियो में डेटा डाला जा रहा है...**")
-            ext = os.path.splitext(file_name)[1].lower()
-            
-            success = False
-            if ext == '.mp3':
-                success = await asyncio.to_thread(process_mp3_metadata, local_audio_path, title, ARTIST_NAME, album, image_data)
-            elif ext == '.m4a':
-                success = await asyncio.to_thread(process_m4a_metadata, local_audio_path, title, ARTIST_NAME, album, image_data)
+                await safe_edit_message(status_msg, f"✍️ **Writing Metadata Ep {ep_num}...**")
+                title = f"Ep {ep_num}"
+                album = f"Ep {ep_num} - Single"
+                ext = os.path.splitext(file_name)[1].lower()
                 
-            if not success:
-                await status_msg.edit("❌ **मेटाडेटा राइटिंग एरर!**")
-                return
+                success = False
+                if ext == '.mp3':
+                    success = await asyncio.to_thread(process_mp3_metadata, local_audio_path, title, ARTIST_NAME, album, image_data)
+                elif ext == '.m4a':
+                    success = await asyncio.to_thread(process_m4a_metadata, local_audio_path, title, ARTIST_NAME, album, image_data)
+                    
+                if not success:
+                    await safe_edit_message(status_msg, f"❌ **Metadata writing error for Ep {ep_num}!**")
+                    return
                 
-            await status_msg.edit("📤 **अपलोड किया जा रहा है...**")
-            duration = get_audio_duration(local_audio_path, ext)
-            audio_attributes = [DocumentAttributeAudio(duration=duration, title=title, performer=ARTIST_NAME)]
-            
-            thumb_path = os.path.join(temp_dir, "thumb.jpg")
-            with open(thumb_path, "wb") as f: f.write(image_data)
-            
-            await bot.send_file(
-                chat_id, local_audio_path,
-                caption=f"✅ **सफलतापूर्वक अपडेट किया गया!**\n\n📌 **Title:** {title}\n🎤 **Artist:** {ARTIST_NAME}",
-                attributes=audio_attributes, thumb=thumb_path, supports_streaming=True
-            )
-            await status_msg.delete()
-        except Exception as e:
-            await status_msg.edit(f"❌ **खराबी आई:** `{str(e)}`")
+                duration = get_audio_duration(local_audio_path, ext)
+                thumb_path = os.path.join(temp_dir, "thumb.jpg")
+                with open(thumb_path, "wb") as f: f.write(image_data)
+                audio_attributes = [DocumentAttributeAudio(duration=duration, title=title, performer=ARTIST_NAME)]
+
+            # Phase 2: Sequential Upload Phase (Strictly one-by-one ordering)
+            async with chat_queue.condition:
+                if chat_queue.current_upload_seq != seq:
+                    await safe_edit_message(status_msg, f"⏸️ **Waiting for Upload Queue (Ep {ep_num})...**")
+                    while chat_queue.current_upload_seq != seq:
+                        await chat_queue.condition.wait()
+                
+                # Turn has come!
+                await safe_edit_message(status_msg, f"📤 **Uploading Ep {ep_num}...**")
+                await safe_send_file(
+                    bot, chat_id, local_audio_path,
+                    caption=f"✅ **Completed!**\n\n📌 **Title:** {title}\n🎤 **Artist:** {ARTIST_NAME}\n⏱️ **Duration:** {duration}s",
+                    attributes=audio_attributes, thumb=thumb_path, supports_streaming=True
+                )
+                await status_msg.delete()
+
+    except Exception as e:
+        logger.error(f"Error in pipeline for Ep {ep_num}: {e}", exc_info=True)
+        await safe_edit_message(status_msg, f"❌ **Pipeline Crashed:** `{str(e)}`")
+    finally:
+        # CRUCIAL: Always unlock the queue for the next file, even if this task failed!
+        async with chat_queue.condition:
+            if chat_queue.current_upload_seq == seq:
+                chat_queue.current_upload_seq += 1
+                chat_queue.condition.notify_all()
 
 async def main() -> None:
     await bot.start(bot_token=BOT_TOKEN)
-    logger.info("🚀 Bot authenticated successfully.")
+    logger.info("🚀 Production Bot authenticated successfully.")
     await start_health_server()
     asyncio.create_task(track_and_expire_states())
-    
-    # क्यू वर्कर को बैकग्राउंड में चालू करें
-    asyncio.create_task(queue_worker())
-    
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
     try: asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit): logger.info("Bot stopped.")
-    
+    except (KeyboardInterrupt, SystemExit): logger.info("Bot stopped cleanly.")
+        
