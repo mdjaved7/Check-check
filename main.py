@@ -13,7 +13,7 @@ from mutagen.mp4 import MP4, MP4Cover
 # लॉगिंग सेट करें
 logging.basicConfig(level=logging.INFO)
 
-# --- Render के लिए वेब सर्वर (ताकि एरर न आए और बॉट हमेशा चलता रहे) ---
+# --- Render के लिए वेब सर्वर ---
 def run_web_server():
     class SimpleHandler(SimpleHTTPRequestHandler):
         def do_GET(self):
@@ -33,7 +33,7 @@ threading.Thread(target=run_web_server, daemon=True).start()
 # --- मुख्य बॉट कोड ---
 API_ID = 34801155             
 API_HASH = "d7846c4d0f2c343dd5b67c80d45409e8"   
-BOT_TOKEN = "8918721301:AAGnaBqk8DVKlIbZY5ITuqJUb0Sk2f2wTcw" 
+BOT_TOKEN = "8918721301:AAGQomTKJ5vtViPRyAhHAZ51_eEmJk1v25I" 
 
 # क्लाइंट शुरू करें
 bot = TelegramClient('tagger_bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
@@ -110,7 +110,8 @@ def process_m4a(file_path, title, artist, album, image_data):
         logging.error(f"M4A एरर: {e}")
         return False
 
-@bot.on(events.NewMessage(pattern='/start'))
+# यहाँ incoming=True जोड़ा गया है ताकि बोट अपने मैसेजेस पर रिस्पॉन्ड न करे
+@bot.on(events.NewMessage(incoming=True, pattern='/start'))
 async def start(event):
     """बॉट स्टार्ट करने पर मैसेज"""
     await event.respond(
@@ -121,7 +122,8 @@ async def start(event):
         "2. फाइल के कैप्शन (Caption) में या उसके तुरंत बाद **फोटो का URL (Link)** भेजें।"
     )
 
-@bot.on(events.NewMessage)
+# यहाँ भी incoming=True जोड़ा गया है ताकि खुद के मैसेज पर लूप न बने
+@bot.on(events.NewMessage(incoming=True))
 async def handle_message(event):
     """सभी मैसेजेस को हैंडल करने के लिए"""
     if event.text and event.text.startswith('/start'):
@@ -206,6 +208,6 @@ async def process_and_send(event, file_obj, file_name, image_url):
             os.remove(local_file_path)
 
 if __name__ == "__main__":
-    print("🚀 Render पर बॉट सफलतापूर्वक चालू हो गया है...")
+    print("🚀 बोट सफलतापूर्वक चालू हो गया है...")
     bot.run_until_disconnected()
     
