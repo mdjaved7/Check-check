@@ -5,7 +5,7 @@ import logging
 import asyncio
 import tempfile
 import aiohttp
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, Set
 
 # Telethon Imports
 from telethon import TelegramClient, events
@@ -17,32 +17,49 @@ from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, error as ID3Error
 from mutagen.mp4 import MP4, MP4Cover
 
-# --- लॉगिंग कॉन्फिगरेशन ---
+# --- Logging Configuration ---
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger("TaggerBot")
 
-# --- एनवायरनमेंट वेरिएबल्स ---
+# --- Environment Variables ---
 API_ID = 34801155
 API_HASH = "d7846c4d0f2c343dd5b67c80d45409e8"
 BOT_TOKEN = "8918721301:AAGQomTKJ5vtViPRyAhHAZ51_eEmJk1v25I"
 
-# --- कॉन्स्टेंट्स ---
+# --- Constants ---
 ARTIST_NAME = "@AllstoryFM2"
 STATE_TTL_SECONDS = 600  
 
 # --- State Management & Queue System ---
 pending_files: Dict[int, Dict[str, Any]] = {}
-DOWNLOAD_SEMAPHORE = asyncio.Semaphore(5)  # Phase 1: Max 5 parallel downloads/processing at a time
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(5)  # Phase 1: Max 5 parallel downloads/processing
 
 class ChatQueue:
-    """हर यूजर/चैट के लिए एक अलग Sequential Queue Manager"""
+    """Production Grade Queue Manager with Locks and Cancellation"""
     def __init__(self):
+        self.lock = asyncio.Lock()
+        self.condition = asyncio.Condition()
+        self.active_tasks: Set[asyncio.Task] = set()
+        
+        # State Variables
+        self.cancelled = False
         self.next_assign_seq = 0
         self.current_upload_seq = 0
-        self.condition = asyncio.Condition()
+        
+        # Counters
+        self.total_count = 0
+        self.completed_count = 0
+        self.processed_count = 0
+        self.failed_count = 0
+        self.current_uploading = "None"
+        
+        # Dashboard Management
+        self.queue_message: Optional[Message] = None
+        self.last_dashboard_update = 0.0
+        self.last_completed_count = 0
 
 chat_queues: Dict[int, ChatQueue] = {}
 
@@ -51,7 +68,7 @@ def get_chat_queue(chat_id: int) -> ChatQueue:
         chat_queues[chat_id] = ChatQueue()
     return chat_queues[chat_id]
 
-# --- नेटिव एसिंक्रोनस हेल्थ चेक वेब सर्वर ---
+# --- Native Async Health Check Web Server ---
 from aiohttp import web
 
 async def health_check_handler(request: web.Request) -> web.Response:
@@ -78,7 +95,7 @@ async def track_and_expire_states() -> None:
         for chat_id in expired_chats:
             pending_files.pop(chat_id, None)
 
-# --- हेल्पर फंक्शन्स ---
+# --- Helpers ---
 def sanitize_filename(filename: str) -> str:
     name = os.path.basename(filename)
     return re.sub(r'[\\/*?:"<>|]', "", name)
@@ -107,18 +124,19 @@ def get_audio_duration(file_path: str, ext: str) -> int:
         logger.error(f"Failed to read audio duration: {e}")
     return 0
 
-# --- एंटी-फ्लड सेफ एडिट और सेंड (Exponential Backoff) ---
-async def safe_edit_message(message: Any, text: str) -> None:
-    try:
-        await message.edit(text)
-    except MessageNotModifiedError:
-        pass  # इग्नोर करें, मैसेज पहले से ही इस टेक्स्ट पर है
-    except FloodWaitError as e:
-        logger.warning(f"FloodWait on edit! Sleeping for {e.seconds}s")
-        await asyncio.sleep(e.seconds + 2)
-        await safe_edit_message(message, text)
-    except Exception as e:
-        logger.error(f"Edit message error: {e}")
+# --- Advanced FloodWait Handlers ---
+async def safe_download_media(client, media, path):
+    retries = 5
+    for attempt in range(retries):
+        try:
+            return await client.download_media(media, path)
+        except FloodWaitError as e:
+            logger.warning(f"FloodWait on download! Sleeping {e.seconds}s")
+            await asyncio.sleep(e.seconds + 2)
+        except Exception as e:
+            if attempt == retries - 1:
+                raise e
+            await asyncio.sleep(2)
 
 async def safe_send_file(client, chat_id, file, **kwargs):
     retries = 5
@@ -126,7 +144,7 @@ async def safe_send_file(client, chat_id, file, **kwargs):
         try:
             return await client.send_file(chat_id, file, **kwargs)
         except FloodWaitError as e:
-            logger.warning(f"FloodWait on upload! Sleeping for {e.seconds}s")
+            logger.warning(f"FloodWait on upload! Sleeping {e.seconds}s")
             await asyncio.sleep(e.seconds + 2)
         except Exception as e:
             logger.error(f"Upload attempt {attempt+1} failed: {e}")
@@ -134,7 +152,76 @@ async def safe_send_file(client, chat_id, file, **kwargs):
                 raise e
             await asyncio.sleep(3 * (attempt + 1))
 
-# --- इमेज डाउनलोडर्स ---
+async def safe_delete_message(message: Message):
+    if not message: return
+    try:
+        await message.delete()
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds + 1)
+        try: await message.delete() except: pass
+    except Exception:
+        pass
+
+# --- Smart Dashboard Updater ---
+async def update_dashboard(client: TelegramClient, chat_id: int, chat_queue: ChatQueue, force: bool = False):
+    """Update the single dashboard strictly applying anti-flood conditions."""
+    async with chat_queue.lock:
+        if chat_queue.cancelled:
+            return
+            
+        now = time.time()
+        time_diff = now - chat_queue.last_dashboard_update
+        completed_diff = chat_queue.completed_count - chat_queue.last_completed_count
+        is_finished = (chat_queue.processed_count >= chat_queue.total_count and chat_queue.total_count > 0)
+        
+        # Throttling Rules: Update if forced, OR >2 seconds passed, OR >=5 completed files since last update.
+        if not force and chat_queue.queue_message and not is_finished:
+            if time_diff < 2.0 and completed_diff < 5:
+                return
+
+        remaining = chat_queue.total_count - (chat_queue.completed_count + chat_queue.failed_count)
+        if remaining < 0: remaining = 0
+            
+        text = (
+            "📊 **Audio Processing Dashboard**\n\n"
+            f"📥 **Total Queue :** {chat_queue.total_count}\n"
+            f"📤 **Uploading :** {chat_queue.current_uploading}\n"
+            f"✅ **Completed :** {chat_queue.completed_count}\n"
+            f"❌ **Failed :** {chat_queue.failed_count}\n"
+            f"⏳ **Remaining :** {remaining}"
+        )
+        
+        msg_obj = chat_queue.queue_message
+        
+        # Update trackers
+        chat_queue.last_dashboard_update = now
+        chat_queue.last_completed_count = chat_queue.completed_count
+
+    # Execute Telegram Network calls completely OUTSIDE the lock to prevent deadlocks
+    try:
+        if msg_obj:
+            try:
+                await msg_obj.edit(text)
+            except MessageNotModifiedError:
+                pass
+            except FloodWaitError as e:
+                # Do NOT sleep here! We skip this update cycle to not delay the whole queue.
+                logger.warning(f"FloodWait on dashboard edit! Skipped for {e.seconds}s")
+        elif not is_finished:
+            try:
+                new_msg = await client.send_message(chat_id, text)
+                async with chat_queue.lock:
+                    # Double-check cancellation while waiting for network
+                    if not chat_queue.cancelled:
+                        chat_queue.queue_message = new_msg
+            except FloodWaitError as e:
+                logger.warning(f"FloodWait on dashboard send! Skipped for {e.seconds}s")
+    except Exception as e:
+        logger.error(f"Failed to update dashboard: {e}")
+        async with chat_queue.lock:
+            chat_queue.queue_message = None
+
+# --- Image Downloaders ---
 async def download_image_from_url(url: str) -> Optional[bytes]:
     try:
         timeout = aiohttp.ClientTimeout(total=15)
@@ -170,7 +257,7 @@ async def download_image_from_tg(client: TelegramClient, url: str) -> Optional[b
         logger.error(f"Error resolving Telegram link: {e}")
     return None
 
-# --- मेटाडेटा इंजन (Strict Cleanup) ---
+# --- Metadata Engine (Strict Cleanup) ---
 def process_mp3_metadata(file_path: str, title: str, artist: str, album: str, image_data: bytes) -> bool:
     try:
         try: audio = MP3(file_path, ID3=ID3)
@@ -179,7 +266,6 @@ def process_mp3_metadata(file_path: str, title: str, artist: str, album: str, im
             audio.add_tags()
         if audio.tags is None: audio.add_tags()
         
-        # Remove all duplicates before writing
         for tag in ["TIT2", "TPE1", "TALB"]: audio.tags.delall(tag)
         keys_to_delete = [k for k in audio.tags.keys() if k.startswith("APIC")]
         for key in keys_to_delete: audio.tags.pop(key, None)
@@ -198,7 +284,6 @@ def process_mp3_metadata(file_path: str, title: str, artist: str, album: str, im
 def process_m4a_metadata(file_path: str, title: str, artist: str, album: str, image_data: bytes) -> bool:
     try:
         audio = MP4(file_path)
-        # Overwrites inherently
         audio["\xa9nam"] = [title]
         audio["\xa9ART"] = [artist]
         audio["\xa9alb"] = [album]
@@ -210,32 +295,77 @@ def process_m4a_metadata(file_path: str, title: str, artist: str, album: str, im
         logger.error(f"Error processing M4A metadata: {e}")
         return False
 
-# --- मुख्य क्लाइंट ---
+# --- Telegram Client ---
 bot = TelegramClient('tagger_bot_session', API_ID, API_HASH)
 
 @bot.on(events.NewMessage(incoming=True, pattern='/start'))
 async def start_handler(event: events.NewMessage.Event) -> None:
-    await event.respond("👋 **नमस्ते! मैं आपका Production-Grade ऑटोमैटिक ऑडियो टैगर बॉट हूँ।**\n\nआप एक साथ अनलिमिटेड फाइल्स भेज सकते हैं। प्रोसेसिंग पैरेलल होगी, लेकिन अपलोडिंग **100% सही क्रम** में ही होगी!")
+    await event.respond("👋 **नमस्ते! मैं आपका Production-Grade ऑटोमैटिक ऑडियो टैगर बॉट हूँ।**\n\nआप एक साथ 10,000+ फाइल्स भेज सकते हैं। मैं बिना रुके काम करूँगा।\n\n💡 _अगर किसी कारण से कतार रीसेट करनी हो, तो /clear इस्तेमाल करें।_")
+
+@bot.on(events.NewMessage(incoming=True, pattern='^/clear$'))
+async def clear_handler(event: events.NewMessage.Event) -> None:
+    chat_id = event.chat_id
+    pending_files.pop(chat_id, None)
+    
+    queue = chat_queues.get(chat_id)
+    if queue:
+        async with queue.lock:
+            queue.cancelled = True
+            
+            # Cancel all running tasks
+            for task in list(queue.active_tasks):
+                if not task.done():
+                    task.cancel()
+            queue.active_tasks.clear()
+            
+            # Request deletion of dashboard
+            if queue.queue_message:
+                asyncio.create_task(safe_delete_message(queue.queue_message))
+                queue.queue_message = None
+            
+            # Total Reset
+            queue.total_count = 0
+            queue.completed_count = 0
+            queue.processed_count = 0
+            queue.failed_count = 0
+            queue.next_assign_seq = 0
+            queue.current_upload_seq = 0
+            queue.current_uploading = "None"
+        
+        # Release all blocked tasks waiting on condition
+        async with queue.condition:
+            queue.condition.notify_all()
+            
+    await event.respond("✅ **Upload queue cleared. All tasks cancelled successfully.**")
 
 @bot.on(events.NewMessage(incoming=True))
 async def incoming_message_handler(event: events.NewMessage.Event) -> None:
     message: Message = event.message
     chat_id = event.chat_id
     
-    if message.text and message.text.startswith('/start'): return
+    if message.text and (message.text.startswith('/start') or message.text.startswith('/clear')): 
+        return
 
     if message.file and message.file.ext.lower() in ['.mp3', '.m4a']:
         raw_name = message.file.name or f"audio{message.file.ext}"
         file_name = sanitize_filename(raw_name)
         caption_text = message.message or ""
-        
         url_match = re.search(r'(https?://[^\s]+)', caption_text)
+        
         if url_match:
             chat_queue = get_chat_queue(chat_id)
-            seq = chat_queue.next_assign_seq
-            chat_queue.next_assign_seq += 1
-            # Parallel processing task create
-            asyncio.create_task(hybrid_pipeline_worker(event, seq, chat_queue, message.media, file_name, url_match.group(1), caption_text))
+            async with chat_queue.lock:
+                chat_queue.cancelled = False
+                chat_queue.total_count += 1
+                seq = chat_queue.next_assign_seq
+                chat_queue.next_assign_seq += 1
+                
+            task = asyncio.create_task(hybrid_pipeline_worker(event, seq, chat_queue, message.media, file_name, url_match.group(1), caption_text))
+            async with chat_queue.lock:
+                chat_queue.active_tasks.add(task)
+            
+            # Trigger dashboard update
+            await update_dashboard(bot, chat_id, chat_queue)
             return
             
         pending_files[chat_id] = {"media": message.media, "file_name": file_name, "timestamp": time.time()}
@@ -250,9 +380,18 @@ async def incoming_message_handler(event: events.NewMessage.Event) -> None:
         if chat_id in pending_files:
             file_data = pending_files.pop(chat_id)
             chat_queue = get_chat_queue(chat_id)
-            seq = chat_queue.next_assign_seq
-            chat_queue.next_assign_seq += 1
-            asyncio.create_task(hybrid_pipeline_worker(event, seq, chat_queue, file_data["media"], file_data["file_name"], url_match.group(1), ""))
+            
+            async with chat_queue.lock:
+                chat_queue.cancelled = False
+                chat_queue.total_count += 1
+                seq = chat_queue.next_assign_seq
+                chat_queue.next_assign_seq += 1
+                
+            task = asyncio.create_task(hybrid_pipeline_worker(event, seq, chat_queue, file_data["media"], file_data["file_name"], url_match.group(1), ""))
+            async with chat_queue.lock:
+                chat_queue.active_tasks.add(task)
+                
+            await update_dashboard(bot, chat_id, chat_queue)
         else:
             await event.respond("ℹ️ **पहले मुझे एक ऑडियो फाइल भेजें**।")
 
@@ -260,28 +399,34 @@ async def incoming_message_handler(event: events.NewMessage.Event) -> None:
 async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_queue: ChatQueue, file_media: Any, file_name: str, image_url: str, caption_text: str) -> None:
     chat_id = event.chat_id
     ep_num = extract_episode_number(file_name, caption_text)
-    status_msg = await event.respond(f"⏳ **Ep {ep_num}** कतार में है... (Order: #{seq+1})")
+    current_task = asyncio.current_task()
     
+    if chat_queue.cancelled:
+        return
+
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             local_audio_path = os.path.join(temp_dir, file_name)
             
-            # Phase 1: Parallel Processing (Controlled by Semaphore)
+            # ----------------------------------------
+            # Phase 1: Parallel Processing (Download & Meta)
+            # ----------------------------------------
             async with DOWNLOAD_SEMAPHORE:
-                await safe_edit_message(status_msg, f"📥 **Downloading Ep {ep_num}...**")
-                await bot.download_media(file_media, local_audio_path)
+                if chat_queue.cancelled: return
                 
-                await safe_edit_message(status_msg, f"🖼️ **Image downloading for Ep {ep_num}...**")
+                await safe_download_media(bot, file_media, local_audio_path)
+                
+                if chat_queue.cancelled: return
+                
                 image_data = await download_image_from_tg(bot, image_url)
                 if not image_data:
-                    # Fallback to direct URL
                     image_data = await download_image_from_url(image_url)
                     
                 if not image_data:
-                    await safe_edit_message(status_msg, f"❌ **Image error for Ep {ep_num}.**")
-                    return
+                    raise ValueError(f"Failed to fetch image for Ep {ep_num}")
 
-                await safe_edit_message(status_msg, f"✍️ **Writing Metadata Ep {ep_num}...**")
+                if chat_queue.cancelled: return
+
                 title = f"Ep {ep_num}"
                 album = f"Ep {ep_num} - Single"
                 ext = os.path.splitext(file_name)[1].lower()
@@ -293,48 +438,96 @@ async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_
                     success = await asyncio.to_thread(process_m4a_metadata, local_audio_path, title, ARTIST_NAME, album, image_data)
                     
                 if not success:
-                    await safe_edit_message(status_msg, f"❌ **Metadata writing error for Ep {ep_num}!**")
-                    return
+                    raise RuntimeError(f"Metadata writing failed for Ep {ep_num}")
                 
                 duration = get_audio_duration(local_audio_path, ext)
                 thumb_path = os.path.join(temp_dir, "thumb.jpg")
                 with open(thumb_path, "wb") as f: f.write(image_data)
                 audio_attributes = [DocumentAttributeAudio(duration=duration, title=title, performer=ARTIST_NAME)]
 
-            # Phase 2: Sequential Upload Phase (Strictly one-by-one ordering)
+            # ----------------------------------------
+            # Phase 2: Strict Sequential Upload 
+            # ----------------------------------------
             async with chat_queue.condition:
-                if chat_queue.current_upload_seq != seq:
-                    await safe_edit_message(status_msg, f"⏸️ **Waiting for Upload Queue (Ep {ep_num})...**")
-                    while chat_queue.current_upload_seq != seq:
-                        await chat_queue.condition.wait()
+                while chat_queue.current_upload_seq != seq:
+                    if chat_queue.cancelled: return
+                    await chat_queue.condition.wait()
                 
-                # Turn has come!
-                await safe_edit_message(status_msg, f"📤 **Uploading Ep {ep_num}...**")
+                if chat_queue.cancelled: return
+                
+                # TURN ACQUIRED
+                async with chat_queue.lock:
+                    chat_queue.current_uploading = f"Ep {ep_num}"
+                    
+                # Force update dashboard immediately for visual feedback
+                await update_dashboard(bot, chat_id, chat_queue, force=True)
+                
                 await safe_send_file(
                     bot, chat_id, local_audio_path,
                     caption=f"✅ **Completed!**\n\n📌 **Title:** {title}\n🎤 **Artist:** {ARTIST_NAME}\n⏱️ **Duration:** {duration}s",
                     attributes=audio_attributes, thumb=thumb_path, supports_streaming=True
                 )
-                await status_msg.delete()
+                
+                async with chat_queue.lock:
+                    chat_queue.completed_count += 1
 
+    except asyncio.CancelledError:
+        logger.info(f"Task for Ep {ep_num} cancelled gracefully.")
     except Exception as e:
-        logger.error(f"Error in pipeline for Ep {ep_num}: {e}", exc_info=True)
-        await safe_edit_message(status_msg, f"❌ **Pipeline Crashed:** `{str(e)}`")
+        logger.error(f"Error in pipeline for Ep {ep_num}: {str(e)}")
+        # Log failure, increase failed count. DO NOT spam chat.
+        async with chat_queue.lock:
+            if not chat_queue.cancelled:
+                chat_queue.failed_count += 1
     finally:
-        # CRUCIAL: Always unlock the queue for the next file, even if this task failed!
+        is_finished = False
+        msg_to_delete = None
+        
+         # 1. Cleanup Task & Increment Processed
+        async with chat_queue.lock:
+            if current_task and current_task in chat_queue.active_tasks:
+                chat_queue.active_tasks.remove(current_task)
+            
+            chat_queue.processed_count += 1
+
+        # 2. Advance the queue securely
         async with chat_queue.condition:
             if chat_queue.current_upload_seq == seq:
                 chat_queue.current_upload_seq += 1
                 chat_queue.condition.notify_all()
 
+        # 3. Check for absolute completion & trigger cleanup
+        async with chat_queue.lock:
+            if chat_queue.total_count > 0 and chat_queue.processed_count >= chat_queue.total_count:
+                is_finished = True
+                msg_to_delete = chat_queue.queue_message
+                chat_queue.queue_message = None
+                
+                # Reset Queue (only if not cancelled, /clear handles its own reset)
+                if not chat_queue.cancelled:
+                    chat_queue.total_count = 0
+                    chat_queue.completed_count = 0
+                    chat_queue.processed_count = 0
+                    chat_queue.failed_count = 0
+                    chat_queue.next_assign_seq = 0
+                    chat_queue.current_upload_seq = 0
+                    chat_queue.current_uploading = "None"
+                    
+        # 4. Final Updates Outside the Lock
+        if is_finished:
+            if msg_to_delete:
+                asyncio.create_task(safe_delete_message(msg_to_delete))
+        else:
+            if not chat_queue.cancelled:
+                await update_dashboard(bot, chat_id, chat_queue)
+
 async def main() -> None:
     await bot.start(bot_token=BOT_TOKEN)
-    logger.info("🚀 Production Bot authenticated successfully.")
+    logger.info("🚀 Production Bot authenticated successfully. Ready for 10,000+ files.")
     await start_health_server()
     asyncio.create_task(track_and_expire_states())
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
     try: asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit): logger.info("Bot stopped cleanly.")
-        
+    except (KeyboardInterrupt, SystemExit): logger.info("Bot stopped cleanly.") 
