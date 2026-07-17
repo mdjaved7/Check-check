@@ -153,14 +153,19 @@ async def safe_send_file(client, chat_id, file, **kwargs):
             await asyncio.sleep(3 * (attempt + 1))
 
 async def safe_delete_message(message: Message):
-    if not message: return
+    if not message:
+        return
     try:
         await message.delete()
     except FloodWaitError as e:
         await asyncio.sleep(e.seconds + 1)
-        try: await message.delete() except: pass
+        try:
+            await message.delete()
+        except:
+            pass
     except Exception:
         pass
+
 
 # --- Smart Dashboard Updater ---
 async def update_dashboard(client: TelegramClient, chat_id: int, chat_queue: ChatQueue, force: bool = False):
