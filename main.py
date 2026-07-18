@@ -30,7 +30,7 @@ API_HASH = "d7846c4d0f2c343dd5b67c80d45409e8"
 BOT_TOKEN = "8918721301:AAGQomTKJ5vtViPRyAhHAZ51_eEmJk1v25I"
 
 # --- Constants ---
-ARTIST_NAME = "@AllstoryFM2"
+ARTIST_NAME = "@AllstoryFM2 JOIN"
 STATE_TTL_SECONDS = 600  
 
 # --- State Management & Queue System ---
